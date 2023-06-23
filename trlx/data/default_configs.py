@@ -89,7 +89,7 @@ def default_ilql_config():
             beta=0,
             steps_for_target_q_sync=5,
             two_qs=True,
-            gen_kwargs=dict(max_new_tokens=56, top_k=20, beta=1, temperature=1.0),
+            gen_kwargs=dict(max_new_tokens=200, top_k=20, beta=1, temperature=1.0),
         ),
     )
 

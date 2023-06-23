@@ -69,7 +69,7 @@ class AccelerateRLTrainer(BaseRLTrainer):
         self.opt = self.setup_optimizer()
         self.scheduler = self.setup_scheduler()
 
-        self.tokenizer = AutoTokenizer.from_pretrained(config.tokenizer.tokenizer_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(config.tokenizer.tokenizer_path, trust_remote_code=True)
         self.tokenizer.padding_side = config.tokenizer.padding_side
         self.tokenizer.truncation_side = config.tokenizer.truncation_side
         self.tokenizer.sep_token = "<sep>"
@@ -318,6 +318,9 @@ class AccelerateRLTrainer(BaseRLTrainer):
         self.eval_pipeline = eval_pipeline
 
     def evaluate(self):  # noqa: C901
+        self.model.eval()
+        self.accelerator.unwrap_model(self.model).eval()
+
         """Samples model on `eval_prompts`, logs stats with `reward_fn` or `metric_fn` if provided"""
         logger.info("Evaluating model")
 
@@ -526,6 +529,8 @@ class AccelerateRLTrainer(BaseRLTrainer):
             for mbs in MiniBatchIterator(self.train_dataloader, self.mb_size, self.num_mb):
                 # For each update per batch
                 for _ in range(self.n_updates_per_batch):
+                    self.model.train()
+                    self.accelerator.unwrap_model(self.model).train()
                     # Note that whereas standard policy gradient methods perform one
                     # gradient update per batch, PPO for example commonly performs
                     # multiple gradient updates on the same batch of data.

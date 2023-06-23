@@ -6,7 +6,9 @@ import torch
 import transformers
 from rich.console import Console
 from rich.table import Table
-
+import torch.nn.functional as F
+from contextlib import contextmanager
+import gc
 import trlx.utils.logging as logging
 from trlx.data.configs import TRLConfig
 from trlx.data.ilql_types import ILQLBatch, ILQLSeq2SeqBatch
@@ -41,15 +43,23 @@ def make_experience(samples, rewards, tokenizer=None, max_length=2048, verbose=T
     all_actions_ixs = []
     all_states_ixs = []
     all_dones = []
+    cdx = 0
     for sample in samples:
+        cdx += 1
         length = 0
+        if len(sample) != 2:
+            continue
+
         all_input_ids.append(torch.tensor(sum((s.tokens for s in sample), ())))
         actions_ixs = []
+        found = False
         for dm in sample:
             if dm.is_output:
+                found = True
                 actions_ixs.append(torch.arange(length - 1, length + len(dm.tokens) - 1))
-
             length += len(dm.tokens)
+        if found == False:
+            print('cdx:',cdx)
 
         states_ixs = torch.hstack((*actions_ixs, torch.tensor(length - 1)))
         all_dones.append(torch.tensor([1] * (len(states_ixs) - 1) + [0], dtype=int))
@@ -99,6 +109,23 @@ def make_experience(samples, rewards, tokenizer=None, max_length=2048, verbose=T
         all_dones,
     )
 
+def logprobs_from_logits(logits, labels):
+    """
+    See: https://github.com/pytorch/pytorch/issues/563#issuecomment-330103591
+    """
+    logp = F.log_softmax(logits, dim=2)
+    logpy = torch.gather(logp, 2, labels.unsqueeze(2)).squeeze(-1)
+    return logpy
+
+class PPODecorators(object):
+    @classmethod
+    @contextmanager
+    def empty_cuda_cache(cls):
+        yield
+        if torch.cuda.is_available():
+            gc.collect()
+            torch.cuda.empty_cache()
+            gc.collect()
 
 @register_trainer
 class AccelerateILQLTrainer(AccelerateRLTrainer):
@@ -127,35 +154,61 @@ class AccelerateILQLTrainer(AccelerateRLTrainer):
             from_fn = AutoModelForCausalLMWithILQLHeads.from_pretrained
             if issubclass(type(config.model.model_path), transformers.PretrainedConfig):
                 from_fn = AutoModelForCausalLMWithILQLHeads.from_config
-        return from_fn(
+        x = from_fn(
             config.model.model_path,
             two_qs=config.method.two_qs,
             alpha=config.method.alpha,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16
         )
+        x.base_model.gradient_checkpointing_enable()
+        return x
 
     def post_backward_callback(self):
         if self.iter_count % self.config.method.steps_for_target_q_sync == 0:
             self.accelerator.unwrap_model(self.model).sync_target_q_heads()
-
+    
+    @PPODecorators.empty_cuda_cache() 
+    def calculate_kl(self, batch):
+         # Ref Model for KL
+        mask_len = (batch.attention_mask[:1]).sum().item()
+        ref_model = self.accelerator.unwrap_model(self.model).ref_model
+        generate_ids = ref_model.generate(batch.input_ids[:1, :mask_len], max_length=2048)
+        kl_inputs = generate_ids
+        kl_attn_mask = torch.ones_like(kl_inputs)
+        with torch.no_grad():
+            logits_ref = ref_model(
+                input_ids=kl_inputs,
+                attention_mask=kl_attn_mask,
+                output_hidden_states=True
+            ).logits
+        logits_base, _, _, _, _ = self.model(
+            input_ids=kl_inputs,
+            attention_mask=kl_attn_mask,
+        )
+        
+        logprobs_ref = logprobs_from_logits(logits_ref[:, :-1, :], kl_inputs[:, 1:])
+        logprobs_base = logprobs_from_logits(logits_base[:, :-1, :], kl_inputs[:, 1:])
+        log_ratio = (logprobs_base - logprobs_ref)[:, mask_len:]
+        ratio = torch.exp(log_ratio)
+        # Unbiased KL-div estimates (`k3`). Ref: http://joschu.net/blog/kl-approx.html
+        # approx_kl = ratio * -0.001 
+        approx_kl = torch.mean((ratio - 1) - log_ratio) * 0.001
+        self.accelerator.backward(approx_kl)
+        return approx_kl 
+    
+    @PPODecorators.empty_cuda_cache() 
     def loss(self, batch: Union[ILQLBatch, ILQLSeq2SeqBatch]):
         batch = to_device(batch, self.accelerator.device)
-        if self.config.model.model_arch_type == "seq2seq":
-            logits, qs, target_qs, vs, _, _ = self.model(
-                input_ids=batch.input_ids,
-                attention_mask=batch.attention_mask,
-                actions_ixs=batch.actions_ixs,
-                states_ixs=batch.states_ixs,
-                decoder_input_ids=batch.decoder_input_ids,
-            )
-        else:
-            logits, qs, target_qs, vs, _ = self.model(
-                input_ids=batch.input_ids,
-                attention_mask=batch.attention_mask,
-                actions_ixs=batch.actions_ixs,
-                states_ixs=batch.states_ixs,
-            )
-
-        return self.ilql.loss((logits, (qs, target_qs, vs)), batch)
+        kl_penalty = self.calculate_kl(batch)
+        
+        logits, qs, target_qs, vs, _ = self.model(
+            input_ids=batch.input_ids,
+            attention_mask=batch.attention_mask,
+            actions_ixs=batch.actions_ixs,
+            states_ixs=batch.states_ixs,
+        )
+        return self.ilql.loss((logits, (qs, target_qs, vs, kl_penalty)), batch)
 
     def prepare_learning(self):
         train_dataloader = self.store.create_loader(self.config.train.batch_size)

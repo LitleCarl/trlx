@@ -12,6 +12,16 @@ import torch.nn.functional as F
 import transformers
 from torch import nn
 from torchtyping import TensorType
+from copy import deepcopy
+
+def create_reference_model(model):
+    parameter_names = [n for n, _ in model.named_parameters()]
+    ref_model = deepcopy(model)
+    # if no layers are shared, return copy of model
+    for param_name in parameter_names:
+        param = ref_model.get_parameter(param_name)
+        param.requires_grad = False
+    return ref_model.eval()
 
 from trlx.data.ilql_types import ILQLBatch
 from trlx.data.method_configs import MethodConfig, register_method
@@ -23,7 +33,6 @@ from trlx.utils.modeling import (
     hf_get_lm_head,
     make_head,
 )
-
 
 def topk_mask(xs: torch.FloatTensor, k: int):
     if k > xs.shape[-1]:
@@ -58,7 +67,7 @@ class ILQLConfig(MethodConfig):
     gen_kwargs: dict
 
     def loss(self, outputs, labels):
-        logits, (qs, target_qs, vs) = outputs
+        logits, (qs, target_qs, vs, kl) = outputs
         terminal_mask = labels.dones[:, :-1]
         n_nonterminal = max(1, terminal_mask.sum())
         # check type of labels
@@ -123,6 +132,7 @@ class ILQLConfig(MethodConfig):
                 loss_v=loss_v.item(),
                 loss_cql=loss_cql.item(),
                 loss_awac=loss_awac.item(),
+                loss_kl=kl.item() or 0
             ),
             values=get_tensor_stats(V, terminal_mask, n_nonterminal),
             qvalues={str(ix): get_tensor_stats(Q[ix], terminal_mask, n_nonterminal) for ix in range(len(Q))},
@@ -192,7 +202,6 @@ class ILQLHeads(nn.Module):
         else:
             self._sync_target_q_heads(self.alpha)
 
-
 class AutoModelForCausalLMWithILQLHeads(PreTrainedModelWrapper):
     """An `AutoModel` class wrapper for `transformers` causal models wtih a language
     modeling head and ILQL heads.
@@ -220,6 +229,7 @@ class AutoModelForCausalLMWithILQLHeads(PreTrainedModelWrapper):
         self.two_qs = two_qs
         self.alpha = alpha
         self.ilql_heads = ILQLHeads(hidden_size, vocab_size, self.two_qs, self.alpha, dtype=dtype)
+        self.ref_model = create_reference_model(base_model)
 
     def forward(
         self,
@@ -237,7 +247,7 @@ class AutoModelForCausalLMWithILQLHeads(PreTrainedModelWrapper):
             past_key_values=past_key_values,
         )
         forward_kwargs["output_hidden_states"] = True
-
+        
         outputs = self.base_model(**forward_kwargs)
         qs, target_qs, vs = self.ilql_heads(outputs.hidden_states[-1], states_ixs=states_ixs, actions_ixs=actions_ixs)
 
