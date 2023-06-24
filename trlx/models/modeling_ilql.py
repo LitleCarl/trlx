@@ -131,8 +131,8 @@ class ILQLConfig(MethodConfig):
                 loss_q=loss_q.item(),
                 loss_v=loss_v.item(),
                 loss_cql=loss_cql.item(),
-                loss_awac=loss_awac.item(),
-                loss_kl=kl.item() or 0
+                loss_awac=loss_awac.item()
+                #loss_kl=kl.item() or 0
             ),
             values=get_tensor_stats(V, terminal_mask, n_nonterminal),
             qvalues={str(ix): get_tensor_stats(Q[ix], terminal_mask, n_nonterminal) for ix in range(len(Q))},

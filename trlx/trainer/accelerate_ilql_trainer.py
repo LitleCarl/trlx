@@ -160,9 +160,20 @@ class AccelerateILQLTrainer(AccelerateRLTrainer):
             config.model.model_path,
             two_qs=config.method.two_qs,
             alpha=config.method.alpha,
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16
+            trust_remote_code=True
         )
+
+        trained_data = torch.load('/models/baichuan-7B-goodcall/output.bin')
+        for param_tensor in x.state_dict():
+            device = x.state_dict()[param_tensor].data
+            if 'rotary_emb' in param_tensor:
+                continue 
+            elif 'ilql_heads' in param_tensor:
+                x.state_dict()[param_tensor].data.copy_(trained_data[param_tensor].to(device).to(torch.bfloat16))
+            else:
+                x.state_dict()[param_tensor].data.copy_(trained_data['base_model.' + param_tensor].to(device).to(torch.bfloat16))
+ 
+
         x.base_model.gradient_checkpointing_enable()
         return x
 
@@ -211,26 +222,35 @@ class AccelerateILQLTrainer(AccelerateRLTrainer):
         good_case_idx = batch.scores[:,0] >= 2.0
         batch_size = good_case_idx.sum().cpu().item() 
         base_model = self.accelerator.unwrap_model(self.model).base_model
-        if batch_size > 0:
+        if batch_size == 0:
+            filtered_input_ids = batch.input_ids[:1]
+            # [batch, 1]
+            filtered_query_len = batch.query_lens[:1]
+
+            filtered_mask = batch.attention_mask[:1]
+            loss_scale = 1e-7
+        else:
             filtered_input_ids = batch.input_ids[good_case_idx]
             # [batch, 1]
             filtered_query_len = batch.query_lens[good_case_idx]
 
             filtered_mask = batch.attention_mask[good_case_idx]
-            # [batch, max_seq_len]
-            labels = filtered_input_ids.clone() 
-            labels[~filtered_mask.bool()] = -100
-            for i in range(batch_size):
-               labels[i, :filtered_query_len[i]] = -100 
+            loss_scale = 5
 
-            loss = base_model(input_ids=filtered_input_ids, attention_mask=filtered_mask, labels=labels).loss
-            with self.accelerator.no_sync(self.model):
-                self.accelerator.backward(loss)       
+        # [batch, max_seq_len]
+        labels = filtered_input_ids.clone() 
+        labels[~filtered_mask.bool()] = -100
+        for i in range(batch_size):
+            labels[i, :filtered_query_len[i]] = -100 
+
+        loss = loss_scale * base_model(input_ids=filtered_input_ids, attention_mask=filtered_mask, labels=labels).loss
+        with self.accelerator.no_sync(self.model):
+            self.accelerator.backward(loss)       
         
     @PPODecorators.empty_cuda_cache() 
     def loss(self, batch: Union[ILQLBatch, ILQLSeq2SeqBatch]):
         batch = to_device(batch, self.accelerator.device)
-        kl_penalty = self.calculate_kl(batch)
+        # kl_penalty = self.calculate_kl(batch)
         
         self.sft_loss(batch) 
 
@@ -241,7 +261,7 @@ class AccelerateILQLTrainer(AccelerateRLTrainer):
             states_ixs=batch.states_ixs,
         )
 
-        return self.ilql.loss((logits, (qs, target_qs, vs, kl_penalty)), batch)
+        return self.ilql.loss((logits, (qs, target_qs, vs, None)), batch)
 
     def prepare_learning(self):
         train_dataloader = self.store.create_loader(self.config.train.batch_size)
