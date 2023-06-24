@@ -39,33 +39,33 @@ def make_experience(samples, rewards, tokenizer=None, max_length=2048, verbose=T
     if tokenizer is not None:
         samples = [tokenize_dialogue(s, tokenizer, max_length) for s in samples]
     all_query_lens = []
+    all_scores = []
     all_input_ids = []
     all_actions_ixs = []
     all_states_ixs = []
     all_dones = []
-    cdx = 0
-    for sample in samples:
-        cdx += 1
+    new_rewards = []
+    for sample, rw in zip(samples, rewards):
         length = 0
         if len(sample) != 2:
+            print('CJX: Found samples without response !!!')
             continue
         all_query_lens.append(torch.tensor([len(sample[0].tokens)], dtype=torch.int32)) 
         all_input_ids.append(torch.tensor(sum((s.tokens for s in sample), ())))
+        all_scores.append(torch.tensor([rw], dtype=torch.float))
+        new_rewards.append(rw)
         actions_ixs = []
-        found = False
         for dm in sample:
             if dm.is_output:
-                found = True
                 actions_ixs.append(torch.arange(length - 1, length + len(dm.tokens) - 1))
             length += len(dm.tokens)
-        if found == False:
-            print('cdx:',cdx)
 
         states_ixs = torch.hstack((*actions_ixs, torch.tensor(length - 1)))
         all_dones.append(torch.tensor([1] * (len(states_ixs) - 1) + [0], dtype=int))
         all_actions_ixs.append(torch.hstack(actions_ixs))
         all_states_ixs.append(states_ixs)
-
+    
+    rewards = new_rewards
     if tokenizer is not None and os.environ.get("RANK", "0") == "0" and verbose:
         logger.info("Logging sample example")
         prompt = tokenizer.decode(all_input_ids[0][: all_states_ixs[0][1]])
@@ -107,7 +107,8 @@ def make_experience(samples, rewards, tokenizer=None, max_length=2048, verbose=T
         all_states_ixs,
         all_actions_ixs,
         all_dones,
-        all_query_lens
+        all_query_lens,
+        all_scores
     )
 
 def logprobs_from_logits(logits, labels):
@@ -177,7 +178,7 @@ class AccelerateILQLTrainer(AccelerateRLTrainer):
         with torch.no_grad():
             self.model.eval()
             self.accelerator.unwrap_model(self.model).eval()
-            generate_ids = self.model.generate(batch.input_ids[:1, :mask_len], max_length=2048)
+            generate_ids = ref_model.generate(batch.input_ids[:1, :mask_len], max_length=2048)
         self.model.train()
         self.accelerator.unwrap_model(self.model).train()
         kl_inputs = generate_ids
@@ -204,20 +205,42 @@ class AccelerateILQLTrainer(AccelerateRLTrainer):
             self.accelerator.backward(approx_kl)
         return approx_kl
     
-    # def sft_loss(self, batch):
-    #     batch.
-    
+    @PPODecorators.empty_cuda_cache()  
+    def sft_loss(self, batch):
+         # STF for good case
+        good_case_idx = batch.scores[:,0] >= 2.0
+        batch_size = good_case_idx.sum().cpu().item() 
+        base_model = self.accelerator.unwrap_model(self.model).base_model
+        if batch_size > 0:
+            filtered_input_ids = batch.input_ids[good_case_idx]
+            # [batch, 1]
+            filtered_query_len = batch.query_lens[good_case_idx]
+
+            filtered_mask = batch.attention_mask[good_case_idx]
+            # [batch, max_seq_len]
+            labels = filtered_input_ids.clone() 
+            labels[~filtered_mask.bool()] = -100
+            for i in range(batch_size):
+               labels[i, :filtered_query_len[i]] = -100 
+
+            loss = base_model(input_ids=filtered_input_ids, attention_mask=filtered_mask, labels=labels).loss
+            with self.accelerator.no_sync(self.model):
+                self.accelerator.backward(loss)       
+        
     @PPODecorators.empty_cuda_cache() 
     def loss(self, batch: Union[ILQLBatch, ILQLSeq2SeqBatch]):
         batch = to_device(batch, self.accelerator.device)
         kl_penalty = self.calculate_kl(batch)
         
+        self.sft_loss(batch) 
+
         logits, qs, target_qs, vs, _ = self.model(
             input_ids=batch.input_ids,
             attention_mask=batch.attention_mask,
             actions_ixs=batch.actions_ixs,
             states_ixs=batch.states_ixs,
         )
+
         return self.ilql.loss((logits, (qs, target_qs, vs, kl_penalty)), batch)
 
     def prepare_learning(self):

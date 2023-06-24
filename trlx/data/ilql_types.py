@@ -36,7 +36,8 @@ class ILQLElement:
     states_ixs: TensorType["states_size"]
     actions_ixs: TensorType["reward_size"]
     dones: TensorType["states_size"]
-    query_len: int
+    query_len: TensorType["query_len"] 
+    score: TensorType["score"]
 
 
 @dataclass
@@ -84,7 +85,8 @@ class ILQLBatch:
     states_ixs: TensorType["batch_size", "states_size"]
     actions_ixs: TensorType["batch_size", "reward_size"]
     dones: TensorType["batch_size", "states_size"]
-
+    query_lens: TensorType["batch_size", "query_len"]
+    scores: TensorType["batch_size", "score_len"] 
 
 @dataclass
 class ILQLSeq2SeqBatch:
