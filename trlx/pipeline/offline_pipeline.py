@@ -186,6 +186,7 @@ def ilql_collate_fn(elems: Iterable[ILQLElement]):
         pad_sequence([x.states_ixs for x in elems], batch_first=True, padding_value=0),
         pad_sequence([x.actions_ixs for x in elems], batch_first=True, padding_value=0),
         pad_sequence([x.dones for x in elems], batch_first=True, padding_value=0),
+        pad_sequence([x.query_len for x in elems], batch_first=True, padding_value=0),
     )
 
 
@@ -194,7 +195,7 @@ class ILQLRolloutStorage(BaseRolloutStore):
     Rollout storage for training ILQL
     """
 
-    def __init__(self, input_ids, attention_mask, rewards, states_ixs, actions_ixs, dones):
+    def __init__(self, input_ids, attention_mask, rewards, states_ixs, actions_ixs, dones, all_query_lens):
         super().__init__()
 
         self.input_ids = input_ids
@@ -203,6 +204,7 @@ class ILQLRolloutStorage(BaseRolloutStore):
         self.states_ixs = states_ixs
         self.actions_ixs = actions_ixs
         self.dones = dones
+        self.all_query_lens = all_query_lens
 
     def __getitem__(self, ix: int) -> ILQLElement:
         return ILQLElement(
@@ -212,6 +214,7 @@ class ILQLRolloutStorage(BaseRolloutStore):
             self.states_ixs[ix],
             self.actions_ixs[ix],
             self.dones[ix],
+            self.all_query_lens[ix]
         )
 
     def __len__(self) -> int:

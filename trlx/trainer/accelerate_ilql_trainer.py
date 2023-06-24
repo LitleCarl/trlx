@@ -172,12 +172,12 @@ class AccelerateILQLTrainer(AccelerateRLTrainer):
     @PPODecorators.empty_cuda_cache() 
     def calculate_kl(self, batch):
         # Ref Model for KL
-        mask_len = (batch.input_ids[:1]).sum().item()
+        mask_len = batch.query_lens[0, 0]
         ref_model = self.accelerator.unwrap_model(self.model).ref_model
         with torch.no_grad():
             self.model.eval()
             self.accelerator.unwrap_model(self.model).eval()
-            generate_ids = ref_model.generate(batch.input_ids[:1, :mask_len], max_length=2048)
+            generate_ids = self.model.generate(batch.input_ids[:1, :mask_len], max_length=2048)
         self.model.train()
         self.accelerator.unwrap_model(self.model).train()
         kl_inputs = generate_ids
@@ -202,7 +202,10 @@ class AccelerateILQLTrainer(AccelerateRLTrainer):
         approx_kl = torch.mean((ratio - 1) - log_ratio) * 0.001
         with self.accelerator.no_sync(self.model):
             self.accelerator.backward(approx_kl)
-        return approx_kl 
+        return approx_kl
+    
+    # def sft_loss(self, batch):
+    #     batch.
     
     @PPODecorators.empty_cuda_cache() 
     def loss(self, batch: Union[ILQLBatch, ILQLSeq2SeqBatch]):
