@@ -36,6 +36,7 @@ class ILQLElement:
     states_ixs: TensorType["states_size"]
     actions_ixs: TensorType["reward_size"]
     dones: TensorType["states_size"]
+    query_len: int
 
 
 @dataclass

@@ -38,7 +38,7 @@ def make_experience(samples, rewards, tokenizer=None, max_length=2048, verbose=T
         logger.info("Collecting rollouts")
     if tokenizer is not None:
         samples = [tokenize_dialogue(s, tokenizer, max_length) for s in samples]
-
+    all_query_lens = []
     all_input_ids = []
     all_actions_ixs = []
     all_states_ixs = []
@@ -49,7 +49,7 @@ def make_experience(samples, rewards, tokenizer=None, max_length=2048, verbose=T
         length = 0
         if len(sample) != 2:
             continue
-
+        all_query_lens.append(torch.tensor([len(sample[0].tokens)], dtype=torch.int32)) 
         all_input_ids.append(torch.tensor(sum((s.tokens for s in sample), ())))
         actions_ixs = []
         found = False
@@ -107,6 +107,7 @@ def make_experience(samples, rewards, tokenizer=None, max_length=2048, verbose=T
         all_states_ixs,
         all_actions_ixs,
         all_dones,
+        all_query_lens
     )
 
 def logprobs_from_logits(logits, labels):
@@ -170,10 +171,15 @@ class AccelerateILQLTrainer(AccelerateRLTrainer):
     
     @PPODecorators.empty_cuda_cache() 
     def calculate_kl(self, batch):
-         # Ref Model for KL
-        mask_len = (batch.attention_mask[:1]).sum().item()
+        # Ref Model for KL
+        mask_len = (batch.input_ids[:1]).sum().item()
         ref_model = self.accelerator.unwrap_model(self.model).ref_model
-        generate_ids = ref_model.generate(batch.input_ids[:1, :mask_len], max_length=2048)
+        with torch.no_grad():
+            self.model.eval()
+            self.accelerator.unwrap_model(self.model).eval()
+            generate_ids = ref_model.generate(batch.input_ids[:1, :mask_len], max_length=2048)
+        self.model.train()
+        self.accelerator.unwrap_model(self.model).train()
         kl_inputs = generate_ids
         kl_attn_mask = torch.ones_like(kl_inputs)
         with torch.no_grad():
@@ -194,7 +200,8 @@ class AccelerateILQLTrainer(AccelerateRLTrainer):
         # Unbiased KL-div estimates (`k3`). Ref: http://joschu.net/blog/kl-approx.html
         # approx_kl = ratio * -0.001 
         approx_kl = torch.mean((ratio - 1) - log_ratio) * 0.001
-        self.accelerator.backward(approx_kl)
+        with self.accelerator.no_sync(self.model):
+            self.accelerator.backward(approx_kl)
         return approx_kl 
     
     @PPODecorators.empty_cuda_cache() 
